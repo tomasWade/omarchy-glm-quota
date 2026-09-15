@@ -1,0 +1,61 @@
+{
+  "schemaVersion": 1,
+  "id": "tomasWade.glm-quota",
+  "name": "GLM Quota",
+  "version": "0.2.0",
+  "author": "tomasWade",
+  "license": "MIT",
+  "description": "GLM token quota as a thermometer-style bar: mercury fill = quota used, floating pointer = time through the window. Click for the 5-hour and weekly breakdown.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "omarchy/BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "GLM Quota",
+    "description": "Thermometer bar: fill = weekly token usage, floating pointer = time through the week. Click: 5-hour + weekly details.",
+    "category": "Status",
+    "allowMultiple": false,
+    "defaultSection": "center",
+    "defaults": {
+      "refreshMinutes": 10,
+      "keyFile": "",
+      "language": "auto",
+      "demo": false
+    },
+    "schema": [
+      {
+        "key": "refreshMinutes",
+        "type": "integer",
+        "label": "Refresh interval (minutes)",
+        "description": "How often to poll the BigModel quota API. The script layer caches for 4 minutes, so values below that hit the same numbers.",
+        "min": 2,
+        "max": 1440,
+        "step": 1,
+        "defaultValue": 10
+      },
+      {
+        "key": "keyFile",
+        "type": "string",
+        "label": "API key file",
+        "defaultValue": "",
+        "description": "File containing the BigModel API key on a single line (chmod 600). Empty uses api.key next to the plugin directory."
+      },
+      {
+        "key": "language",
+        "type": "string",
+        "label": "Language",
+        "defaultValue": "auto",
+        "description": "UI language: auto (follow system locale), zh, or en."
+      },
+      {
+        "key": "demo",
+        "type": "boolean",
+        "label": "Demo data",
+        "defaultValue": false,
+        "description": "Render canned numbers instead of fetching, for previewing the visuals."
+      }
+    ]
+  }
+}

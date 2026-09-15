@@ -1,0 +1,131 @@
+#!/bin/bash
+# glm-quota — fetch GLM quota usage and emit JSON for the tomasWade.glm-quota
+# omarchy bar plugin.
+#
+# Contract: ALWAYS prints one valid JSON object and exits 0. Network/API/key
+# failures fall back to the cached report (marked "stale": true) or to an
+# empty report, so the QML caller never has to handle a broken pipe.
+#
+# Output shape:
+#   { "level": "pro", "fetchedAt": <epoch ms>, "stale": false,
+#     "error": "",   # "" | "nokey" | "unauthorized" | "network" | "badresp"
+#     "fiveHour": { "used", "quota", "remaining", "windowMs", "nextResetMs" },
+#     "weekly":   { ... } }
+#
+# Error codes (machine-readable; the QML side maps them to localized text):
+#   nokey         api.key missing or empty
+#   unauthorized  HTTP 401/403 — key invalid or expired
+#   network       curl could not reach the API
+#   badresp       API answered but the payload had no usable limits
+#
+# Usage: glm-quota [--force] [--key-file <path>]
+#   --force      bypass the cache TTL and hit the API
+#   --key-file   key file override; default: api.key next to the plugin root
+
+set -u
+
+PLUGIN_DIR="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+CACHE="$HOME/.cache/glm-quota.json"
+TTL=240
+API="https://open.bigmodel.cn/api/monitor/usage/quota/limit"
+FIVE_HOUR_MS=18000000
+WEEK_MS=604800000
+
+FORCE=0
+KEY_FILE="$PLUGIN_DIR/api.key"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --force) FORCE=1 ;;
+    --key-file) shift; KEY_FILE="${1:-}" ;;
+    *) ;;
+  esac
+  shift
+done
+
+now_ms() { date +%s%3N; }
+
+emit_empty() {
+  jq -nc --arg err "$1" --argjson now "$(now_ms)" \
+    '{level: "", fetchedAt: $now, stale: true, error: $err, fiveHour: null, weekly: null}'
+}
+
+# Serve the cached report, flagged stale and stamped with the failure code so
+# the UI can explain why the numbers stopped updating.
+emit_stale_cache() {
+  jq -c --arg err "$1" '.stale = true | .error = $err' "$CACHE"
+}
+
+cache_is_usable() {
+  [ -f "$CACHE" ] && jq -e '(.fiveHour != null) and (.weekly != null)' "$CACHE" >/dev/null 2>&1
+}
+
+# Fresh cache short-circuits the request.
+if [ "$FORCE" -eq 0 ] && cache_is_usable; then
+  age=$(( $(date +%s) - $(stat -c %Y "$CACHE") ))
+  if [ "$age" -lt "$TTL" ]; then
+    cat "$CACHE"
+    exit 0
+  fi
+fi
+
+key=""
+[ -f "$KEY_FILE" ] && key=$(head -n1 "$KEY_FILE" | tr -d '[:space:]')
+
+if [ -z "$key" ]; then
+  if cache_is_usable; then
+    emit_stale_cache "nokey"
+  else
+    emit_empty "nokey"
+  fi
+  exit 0
+fi
+
+body_file="$(mktemp)"
+trap 'rm -f "$body_file"' EXIT
+http=$(curl -s --max-time 10 -o "$body_file" -w '%{http_code}' \
+  "$API" -H "Authorization: Bearer $key") || http="000"
+resp=$(cat "$body_file" 2>/dev/null) || resp=""
+
+if [ "$http" = "000" ]; then
+  if cache_is_usable; then emit_stale_cache "network"; else emit_empty "network"; fi
+  exit 0
+fi
+if [ "$http" = "401" ] || [ "$http" = "403" ]; then
+  if cache_is_usable; then emit_stale_cache "unauthorized"; else emit_empty "unauthorized"; fi
+  exit 0
+fi
+
+# The API can also answer HTTP 200 with an embedded auth failure
+# ({"code":401,"msg":"令牌已过期或验证不正确","success":false}).
+api_code=$(jq -r 'try (.code // 0) catch 0' <<<"$resp" 2>/dev/null) || api_code=0
+if [ "$api_code" = "401" ] || [ "$api_code" = "403" ]; then
+  if cache_is_usable; then emit_stale_cache "unauthorized"; else emit_empty "unauthorized"; fi
+  exit 0
+fi
+
+report=$(jq -nc --argjson now "$(now_ms)" --argjson fh "$FIVE_HOUR_MS" \
+    --argjson wk "$WEEK_MS" --arg resp "$resp" '
+  ($resp | try fromjson catch null) as $r
+  | ($r.data // null) as $d
+  | def win(unit; ms):
+      ([$d.limits[]? | select(.unit == unit)][0]
+       | if . then
+           { used: (.currentValue // 0), quota: (.usage // 0),
+             remaining: (.remaining // 0), windowMs: ms,
+             nextResetMs: (.nextResetTime // 0) }
+         else null end);
+  { level: ($d.level // ""), fetchedAt: $now, stale: false, error: "",
+    fiveHour: win(3; $fh), weekly: win(6; $wk) }
+' 2>/dev/null) || report=""
+
+if jq -e '(.fiveHour != null) and (.weekly != null)
+          and (.fiveHour.quota > 0) and (.weekly.quota > 0)
+          and (.fiveHour.nextResetMs > 0) and (.weekly.nextResetMs > 0)' \
+    <<<"$report" >/dev/null 2>&1; then
+  umask 077
+  printf '%s' "$report" > "$CACHE.tmp" && mv -f "$CACHE.tmp" "$CACHE"
+  printf '%s\n' "$report"
+else
+  if cache_is_usable; then emit_stale_cache "badresp"; else emit_empty "badresp"; fi
+fi
+exit 0
