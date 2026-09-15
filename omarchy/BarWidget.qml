@@ -8,7 +8,7 @@ import qs.Commons
 // Panel.qml, loaded once here; the gauge just mirrors its properties.
 BarWidget {
   id: root
-  moduleName: "tomasWade.glm-quota"
+  moduleName: "tomaswade.glm-quota"
 
   function injectPanel() {
     var target = panelLoader.item

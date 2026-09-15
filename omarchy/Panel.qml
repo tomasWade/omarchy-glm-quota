@@ -15,8 +15,8 @@ import qs.Ui
 // preview needs to show.
 Panel {
   id: root
-  moduleName: "tomasWade.glm-quota"
-  ipcTarget: "tomasWade.glm-quota"
+  moduleName: "tomaswade.glm-quota"
+  ipcTarget: "tomaswade.glm-quota"
   manageIpc: false
 
   property var anchorItem: null

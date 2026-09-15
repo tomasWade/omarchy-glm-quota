@@ -43,8 +43,8 @@ The plugin never reads keys from environment variables.
    folder and lock it down:
 
    ```bash
-   echo -n "YOUR_KEY" > ~/.config/omarchy/plugins/tomasWade.glm-quota/api.key
-   chmod 600 ~/.config/omarchy/plugins/tomasWade.glm-quota/api.key
+   echo -n "YOUR_KEY" > ~/.config/omarchy/plugins/tomaswade.glm-quota/api.key
+   chmod 600 ~/.config/omarchy/plugins/tomaswade.glm-quota/api.key
    ```
 
    The panel shows a red hint with the exact expected path when the key is
@@ -55,7 +55,7 @@ The plugin never reads keys from environment variables.
 Inline in `~/.config/omarchy/shell.json`, e.g.
 
 ```json
-{ "id": "tomasWade.glm-quota", "refreshMinutes": 10, "language": "auto" }
+{ "id": "tomaswade.glm-quota", "refreshMinutes": 10, "language": "auto" }
 ```
 
 | Setting | Default | Description |
@@ -79,7 +79,7 @@ Inline in `~/.config/omarchy/shell.json`, e.g.
 ## Uninstall
 
 ```bash
-omarchy plugin remove tomasWade.glm-quota
+omarchy plugin remove tomaswade.glm-quota
 rm -f ~/.cache/glm-quota.json
 ```
 

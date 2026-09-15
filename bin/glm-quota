@@ -1,5 +1,5 @@
 #!/bin/bash
-# glm-quota — fetch GLM quota usage and emit JSON for the tomasWade.glm-quota
+# glm-quota — fetch GLM quota usage and emit JSON for the tomaswade.glm-quota
 # omarchy bar plugin.
 #
 # Contract: ALWAYS prints one valid JSON object and exits 0. Network/API/key
