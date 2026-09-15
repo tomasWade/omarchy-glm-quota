@@ -5,6 +5,12 @@ The mercury fill shows how much of the **weekly** quota is spent; a floating
 caret marks how far through the window's *time* you are. Click it for the
 5-hour window and weekly breakdown.
 
+On the desktop — the gauge sits in the bar's center section, click opens the popup:
+
+![overview](docs/overview.png)
+
+Close-up — bar gauge (fill + time caret + ruler ticks) and the popup detail:
+
 ![preview](docs/preview.png)
 
 - **Bar widget** — weekly usage as a thermometer gauge: fill = quota spent,
