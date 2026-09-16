@@ -233,6 +233,7 @@ Panel {
     switch (errorCode) {
       case "": return ""
       case "nokey": return tr("API key 未配置", "API key missing")
+      case "badkey": return tr("API key 文件不安全", "API key file insecure")
       case "unauthorized": return tr("API key 无效或已过期", "API key invalid or expired")
       case "network": return tr("网络错误", "network error")
       case "badresp": return tr("接口返回异常", "unexpected API response")
@@ -242,17 +243,23 @@ Panel {
     }
   }
 
-  // Actionable hint for the two key-related failures. The path shown is the
+  // Actionable hint for the key-related failures. The path shown is the
   // effective key file: the setting override, or api.key at the plugin root.
-  readonly property bool keyTrouble: errorCode === "nokey" || errorCode === "unauthorized"
+  readonly property bool keyTrouble: errorCode === "nokey" || errorCode === "badkey" || errorCode === "unauthorized"
   readonly property string keyPathShown: {
     if (keyFileSetting !== "") return keyFileSetting
     var i = scriptPath.lastIndexOf("/bin/")
     return i > 0 ? scriptPath.substring(0, i) + "/api.key" : scriptPath + ".key"
   }
-  readonly property string keyGuidance: useZh
-    ? "⚠ 请到 open.bigmodel.cn 控制台创建 API Key，保存到 " + keyPathShown + "（单行纯 key，建议 chmod 600）"
-    : "⚠ Create an API key in the open.bigmodel.cn console and save it to " + keyPathShown + " (single line, chmod 600 recommended)"
+  readonly property string keyGuidance: {
+    if (errorCode === "badkey")
+      return useZh
+        ? "⚠ Key 文件须为常规文件（不能是符号链接）、仅所有者可读写（chmod 600），内容为单行纯 key：" + keyPathShown
+        : "⚠ Key file must be a regular file (no symlinks) with owner-only permissions (chmod 600), one bare key per line: " + keyPathShown
+    return useZh
+      ? "⚠ 请到 open.bigmodel.cn 控制台创建 API Key，保存到 " + keyPathShown + "（单行纯 key，chmod 600）"
+      : "⚠ Create an API key in the open.bigmodel.cn console and save it to " + keyPathShown + " (single line, chmod 600)"
+  }
 
   Component.onCompleted: refresh(false)
 

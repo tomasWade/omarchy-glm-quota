@@ -8,28 +8,49 @@
 #
 # Output shape:
 #   { "level": "pro", "fetchedAt": <epoch ms>, "stale": false,
-#     "error": "",   # "" | "nokey" | "unauthorized" | "network" | "badresp"
+#     "error": "",   # "" | "nokey" | "badkey" | "unauthorized" | "network" | "badresp"
 #     "fiveHour": { "used", "quota", "remaining", "windowMs", "nextResetMs" },
 #     "weekly":   { ... } }
 #
 # Error codes (machine-readable; the QML side maps them to localized text):
 #   nokey         api.key missing or empty
+#   badkey        key file failed the security check: must be a regular file
+#                 (not a symlink), owned by the current user, with no
+#                 group/other permission bits, holding one bare key of
+#                 [A-Za-z0-9._-] on the first line
 #   unauthorized  HTTP 401/403 — key invalid or expired
 #   network       curl could not reach the API
-#   badresp       API answered but the payload had no usable limits
+#   badresp       API answered but the payload had no usable limits, or the
+#                 response exceeded the byte ceiling
+#
+# Security design (review hardening):
+#   * The API key never appears in any process argv: it is fed to curl
+#     through a config stream on a private file descriptor (-K <(...)).
+#   * The key's charset is validated before it enters the curl config, so
+#     the key file cannot inject curl directives.
+#   * The response body is capped on the producer side: it flows through
+#     `head -c MAX+1`, and anything over MAX_BYTES is rejected before
+#     any parsing happens.
+#   * Cache updates are published through an exclusive, unpredictable
+#     same-directory temporary (mktemp) and an atomic rename; key and
+#     cache paths are never followed through symlinks.
 #
 # Usage: glm-quota [--force] [--key-file <path>]
 #   --force      bypass the cache TTL and hit the API
 #   --key-file   key file override; default: api.key next to the plugin root
 
 set -u
+umask 077
 
 PLUGIN_DIR="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
 CACHE="$HOME/.cache/glm-quota.json"
+CACHE_DIR="$(dirname "$CACHE")"
 TTL=240
+MAX_BYTES=65536
 API="https://open.bigmodel.cn/api/monitor/usage/quota/limit"
 FIVE_HOUR_MS=18000000
 WEEK_MS=604800000
+UID_="$(id -u)"
 
 FORCE=0
 KEY_FILE="$PLUGIN_DIR/api.key"
@@ -55,9 +76,63 @@ emit_stale_cache() {
   jq -c --arg err "$1" '.stale = true | .error = $err' "$CACHE"
 }
 
-cache_is_usable() {
-  [ -f "$CACHE" ] && jq -e '(.fiveHour != null) and (.weekly != null)' "$CACHE" >/dev/null 2>&1
+# Stale cache when we have a usable one, empty report otherwise.
+emit_fail() {
+  if cache_is_usable; then
+    emit_stale_cache "$1"
+  else
+    emit_empty "$1"
+  fi
 }
+
+# A directory we are willing to read/write through: a real directory (never a
+# symlink), owned by the current user, with no group/other write permission.
+dir_is_safe() {
+  [ -d "$1" ] && [ ! -L "$1" ] || return 1
+  local mode owner
+  mode=$(stat -c %a "$1" 2>/dev/null) || return 1
+  owner=$(stat -c %u "$1" 2>/dev/null) || return 1
+  [ "$owner" = "$UID_" ] || return 1
+  case "$mode" in ''|*[!0-7]*) return 1 ;; esac
+  [ $(( (8#$mode) & 022 )) -eq 0 ]
+}
+
+# Cache file is usable only when the cache directory passed verification and
+# the file itself is a regular file we never follow through a symlink.
+cache_is_usable() {
+  [ "${CACHE_OK:-0}" = 1 ] || return 1
+  [ -f "$CACHE" ] && [ ! -L "$CACHE" ] || return 1
+  jq -e '(.fiveHour != null) and (.weekly != null)' "$CACHE" >/dev/null 2>&1
+}
+
+# Read and validate the API key.
+# Returns: 0 = key ok (in $key), 1 = missing/empty (nokey), 2 = unsafe (badkey).
+read_key() {
+  local f="$1" mode owner line
+  key=""
+  [ -n "$f" ] || return 1
+  [ -f "$f" ] || return 1
+  [ -L "$f" ] && return 2
+  mode=$(stat -c %a "$f" 2>/dev/null) || return 2
+  owner=$(stat -c %u "$f" 2>/dev/null) || return 2
+  [ "$owner" = "$UID_" ] || return 2
+  case "$mode" in ''|*[!0-7]*) return 2 ;; esac
+  [ $(( (8#$mode) & 077 )) -eq 0 ] || return 2
+  IFS= read -r -n 256 line < "$f" || true
+  key=$(printf '%s' "$line" | tr -d '[:space:]')
+  [ -n "$key" ] || return 1
+  # Charset whitelist: also guarantees the key cannot break out of the curl
+  # config string below.
+  case "$key" in *[!A-Za-z0-9._-]*) return 2 ;; esac
+  [ "${#key}" -le 128 ] || return 2
+  return 0
+}
+
+CACHE_OK=0
+if [ ! -e "$CACHE_DIR" ]; then
+  mkdir -p "$CACHE_DIR" 2>/dev/null || true
+fi
+dir_is_safe "$CACHE_DIR" && CACHE_OK=1
 
 # Fresh cache short-circuits the request.
 if [ "$FORCE" -eq 0 ] && cache_is_usable; then
@@ -68,39 +143,49 @@ if [ "$FORCE" -eq 0 ] && cache_is_usable; then
   fi
 fi
 
-key=""
-[ -f "$KEY_FILE" ] && key=$(head -n1 "$KEY_FILE" | tr -d '[:space:]')
-
-if [ -z "$key" ]; then
-  if cache_is_usable; then
-    emit_stale_cache "nokey"
-  else
-    emit_empty "nokey"
-  fi
-  exit 0
-fi
+read_key "$KEY_FILE"
+case $? in
+  0) ;;
+  1) emit_fail "nokey"; exit 0 ;;
+  *) emit_fail "badkey"; exit 0 ;;
+esac
 
 body_file="$(mktemp)"
 trap 'rm -f "$body_file"' EXIT
-http=$(curl -s --max-time 10 -o "$body_file" -w '%{http_code}' \
-  "$API" -H "Authorization: Bearer $key") || http="000"
-resp=$(cat "$body_file" 2>/dev/null) || resp=""
 
-if [ "$http" = "000" ]; then
-  if cache_is_usable; then emit_stale_cache "network"; else emit_empty "network"; fi
+# The key travels through a private pipe into curl's config reader (-K), so
+# it never shows up in any argv. The body (plus a trailing "\n<http_code>"
+# write-out) flows through `head -c MAX+1`: a response larger than MAX_BYTES
+# is cut off producer-side and rejected below before parsing.
+curl -s --max-time 10 -w '\n%{http_code}' "$API" \
+  -K <(printf 'header = "Authorization: Bearer %s"\n' "$key") \
+  | head -c $((MAX_BYTES + 1)) > "$body_file" || true
+
+# Overflow rejection BEFORE any parsing.
+if [ "$(wc -c < "$body_file")" -gt "$MAX_BYTES" ]; then
+  emit_fail "badresp"
   exit 0
 fi
+
+http="$(tail -n 1 "$body_file" 2>/dev/null)"
+case "$http" in
+  [0-9][0-9][0-9]) ;;
+  *) http="000" ;;
+esac
+resp="$(sed '$d' "$body_file" 2>/dev/null)"
+
+if [ "$http" = "000" ]; then
+  emit_fail "network"; exit 0
+fi
 if [ "$http" = "401" ] || [ "$http" = "403" ]; then
-  if cache_is_usable; then emit_stale_cache "unauthorized"; else emit_empty "unauthorized"; fi
-  exit 0
+  emit_fail "unauthorized"; exit 0
 fi
 
 # The API can also answer HTTP 200 with an embedded auth failure
 # ({"code":401,"msg":"令牌已过期或验证不正确","success":false}).
 api_code=$(jq -r 'try (.code // 0) catch 0' <<<"$resp" 2>/dev/null) || api_code=0
 if [ "$api_code" = "401" ] || [ "$api_code" = "403" ]; then
-  if cache_is_usable; then emit_stale_cache "unauthorized"; else emit_empty "unauthorized"; fi
-  exit 0
+  emit_fail "unauthorized"; exit 0
 fi
 
 report=$(jq -nc --argjson now "$(now_ms)" --argjson fh "$FIVE_HOUR_MS" \
@@ -122,10 +207,17 @@ if jq -e '(.fiveHour != null) and (.weekly != null)
           and (.fiveHour.quota > 0) and (.weekly.quota > 0)
           and (.fiveHour.nextResetMs > 0) and (.weekly.nextResetMs > 0)' \
     <<<"$report" >/dev/null 2>&1; then
-  umask 077
-  printf '%s' "$report" > "$CACHE.tmp" && mv -f "$CACHE.tmp" "$CACHE"
+  # Publish through an exclusive, unpredictable same-directory temporary,
+  # then rename over the cache path. rename(2) replaces a symlink planted
+  # at the destination instead of following it.
+  if [ "$CACHE_OK" = 1 ]; then
+    cache_tmp="$(mktemp "$CACHE_DIR/.glm-quota.XXXXXX" 2>/dev/null)" \
+      && { printf '%s' "$report" > "$cache_tmp" 2>/dev/null \
+           && mv -f "$cache_tmp" "$CACHE" 2>/dev/null \
+           || rm -f "$cache_tmp"; } || true
+  fi
   printf '%s\n' "$report"
 else
-  if cache_is_usable; then emit_stale_cache "badresp"; else emit_empty "badresp"; fi
+  emit_fail "badresp"
 fi
 exit 0

@@ -47,8 +47,12 @@ The plugin never reads keys from environment variables.
    chmod 600 ~/.config/omarchy/plugins/tomaswade.glm-quota/api.key
    ```
 
+   These permissions are enforced, not suggested: the key file must be a
+   regular file (no symlinks) owned by you with no group/other access
+   (`chmod 600`), otherwise the plugin reports `badkey` and refuses to use it.
+
    The panel shows a red hint with the exact expected path when the key is
-   missing, invalid, or expired.
+   missing, unsafe, invalid, or expired.
 
 ## Settings
 
@@ -71,10 +75,25 @@ Inline in `~/.config/omarchy/shell.json`, e.g.
   `open.bigmodel.cn/api/monitor/usage/quota/limit`, caches the response in
   `~/.cache/glm-quota.json` for 240 s, and always prints one valid JSON
   object — network or auth failures fall back to the cached report marked
-  `stale` with a machine-readable error code (`nokey`, `unauthorized`,
-  `network`, `badresp`).
+  `stale` with a machine-readable error code (`nokey`, `badkey`,
+  `unauthorized`, `network`, `badresp`).
 - The QML side computes the time carets locally from `nextResetTime`, so
   they keep moving between polls without any requests.
+
+## Security
+
+- The API key is fed to curl through a private pipe (`curl -K`), so it never
+  appears in any process's `argv` (no leak via `ps`), and its charset is
+  validated before use.
+- The key file must pass a strict check: regular file (never followed
+  through a symlink), owned by the current user, no group/other permission
+  bits — `chmod 600` it and keep it that way.
+- API responses are capped on the producer side at 64 KiB; anything larger
+  is rejected before parsing, so a hostile endpoint cannot exhaust disk or
+  memory.
+- Cache updates go through an exclusive, unpredictable same-directory
+  temporary file (`mktemp`) and an atomic rename; planted symlinks on the
+  cache path are replaced, never followed.
 
 ## Uninstall
 

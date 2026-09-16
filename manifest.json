@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "tomaswade.glm-quota",
   "name": "GLM Quota",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "author": "tomasWade",
   "license": "MIT",
   "description": "GLM token quota as a thermometer-style bar: mercury fill = quota used, floating pointer = time through the window. Click for the 5-hour and weekly breakdown.",
@@ -40,7 +40,7 @@
         "type": "string",
         "label": "API key file",
         "defaultValue": "",
-        "description": "File containing the BigModel API key on a single line (chmod 600). Empty uses api.key next to the plugin directory."
+        "description": "File with the BigModel API key on a single line. Must be a regular file (not a symlink) owned by you with chmod 600 — anything less private is rejected. Empty uses api.key next to the plugin directory."
       },
       {
         "key": "language",
