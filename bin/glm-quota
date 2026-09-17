@@ -15,25 +15,35 @@
 # Error codes (machine-readable; the QML side maps them to localized text):
 #   nokey         api.key missing or empty
 #   badkey        key file failed the security check: must be a regular file
-#                 (not a symlink), owned by the current user, with no
-#                 group/other permission bits, holding one bare key of
-#                 [A-Za-z0-9._-] on the first line
+#                 (never followed through a symlink, nor any parent directory
+#                 component), owned by the current user, with no group/other
+#                 permission bits, holding one bare key of [A-Za-z0-9._-] on
+#                 the first line
 #   unauthorized  HTTP 401/403 — key invalid or expired
 #   network       curl could not reach the API
 #   badresp       API answered but the payload had no usable limits, or the
 #                 response exceeded the byte ceiling
 #
-# Security design (review hardening):
-#   * The API key never appears in any process argv: it is fed to curl
-#     through a config stream on a private file descriptor (-K <(...)).
+# Security design (review hardening, round 2):
+#   * All file access goes through bin/glm-quota-secio.py, which resolves
+#     paths component-by-component with O_NOFOLLOW, keeps the verified
+#     directory descriptor open, and fstat(2)s every file *after* opening
+#     it. Checks and uses are fused on the same descriptor, so swapping a
+#     pathname (or a parent component) for a symlink between a check and a
+#     use is structurally impossible.
+#   * The API key never appears in any process argv or environment: it is
+#     read through a secured descriptor and fed to curl through a config
+#     stream on a private file descriptor (-K <(...)).
 #   * The key's charset is validated before it enters the curl config, so
 #     the key file cannot inject curl directives.
 #   * The response body is capped on the producer side: it flows through
 #     `head -c MAX+1`, and anything over MAX_BYTES is rejected before
 #     any parsing happens.
 #   * Cache updates are published through an exclusive, unpredictable
-#     same-directory temporary (mktemp) and an atomic rename; key and
-#     cache paths are never followed through symlinks.
+#     same-directory temporary (secrets(3)-random name, O_CREAT|O_EXCL|
+#     O_NOFOLLOW) created and renamed relative to the pinned directory
+#     descriptor; planted symlinks on the cache path are replaced by
+#     rename(2), never followed.
 #
 # Usage: glm-quota [--force] [--key-file <path>]
 #   --force      bypass the cache TTL and hit the API
@@ -42,18 +52,18 @@
 set -u
 umask 077
 
-PLUGIN_DIR="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
-CACHE="$HOME/.cache/glm-quota.json"
-CACHE_DIR="$(dirname "$CACHE")"
+BIN_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+SECIO="$BIN_DIR/glm-quota-secio.py"
+CACHE_DIR="$HOME/.cache"
+CACHE_NAME="glm-quota.json"
 TTL=240
 MAX_BYTES=65536
 API="https://open.bigmodel.cn/api/monitor/usage/quota/limit"
 FIVE_HOUR_MS=18000000
 WEEK_MS=604800000
-UID_="$(id -u)"
 
 FORCE=0
-KEY_FILE="$PLUGIN_DIR/api.key"
+KEY_FILE="${BIN_DIR%/bin}/api.key"
 while [ $# -gt 0 ]; do
   case "$1" in
     --force) FORCE=1 ;;
@@ -71,79 +81,59 @@ emit_empty() {
 }
 
 # Serve the cached report, flagged stale and stamped with the failure code so
-# the UI can explain why the numbers stopped updating.
+# the UI can explain why the numbers stopped updating. The cache body was
+# already read through a verified descriptor; it is only re-framed here.
 emit_stale_cache() {
-  jq -c --arg err "$1" '.stale = true | .error = $err' "$CACHE"
+  jq -c --arg err "$1" '.stale = true | .error = $err' <<<"$CACHED_BODY"
 }
 
 # Stale cache when we have a usable one, empty report otherwise.
 emit_fail() {
-  if cache_is_usable; then
+  if [ "$CACHED_OK" = 1 ]; then
     emit_stale_cache "$1"
   else
     emit_empty "$1"
   fi
 }
 
-# A directory we are willing to read/write through: a real directory (never a
-# symlink), owned by the current user, with no group/other write permission.
-dir_is_safe() {
-  [ -d "$1" ] && [ ! -L "$1" ] || return 1
-  local mode owner
-  mode=$(stat -c %a "$1" 2>/dev/null) || return 1
-  owner=$(stat -c %u "$1" 2>/dev/null) || return 1
-  [ "$owner" = "$UID_" ] || return 1
-  case "$mode" in ''|*[!0-7]*) return 1 ;; esac
-  [ $(( (8#$mode) & 022 )) -eq 0 ]
-}
+# --- Cache read: one fused secure operation -------------------------------
+# secio walks ~/.cache with O_NOFOLLOW, pins the verified directory
+# descriptor, opens the cache file with O_NOFOLLOW, fstat(2)s and reads it
+# through that descriptor, and prints "<mtime_seconds>\n<body>".
+CACHED_BODY=""
+CACHED_MTIME=0
+CACHED_OK=0
+CACHE_W=1
+sec_out="$(python3 "$SECIO" read-cache "$CACHE_DIR" "$CACHE_NAME" 2>/dev/null)"
+case $? in
+  0)
+    CACHED_MTIME="${sec_out%%$'\n'*}"
+    CACHED_BODY="${sec_out#*$'\n'}"
+    if [ -n "$CACHED_BODY" ] && [ "$CACHED_MTIME" != "$CACHED_BODY" ] \
+      && jq -e '(.fiveHour != null) and (.weekly != null)' \
+           <<<"$CACHED_BODY" >/dev/null 2>&1; then
+      CACHED_OK=1
+    fi
+    ;;
+  2|9) CACHE_W=0 ;;
+esac
 
-# Cache file is usable only when the cache directory passed verification and
-# the file itself is a regular file we never follow through a symlink.
-cache_is_usable() {
-  [ "${CACHE_OK:-0}" = 1 ] || return 1
-  [ -f "$CACHE" ] && [ ! -L "$CACHE" ] || return 1
-  jq -e '(.fiveHour != null) and (.weekly != null)' "$CACHE" >/dev/null 2>&1
-}
-
-# Read and validate the API key.
-# Returns: 0 = key ok (in $key), 1 = missing/empty (nokey), 2 = unsafe (badkey).
-read_key() {
-  local f="$1" mode owner line
-  key=""
-  [ -n "$f" ] || return 1
-  [ -f "$f" ] || return 1
-  [ -L "$f" ] && return 2
-  mode=$(stat -c %a "$f" 2>/dev/null) || return 2
-  owner=$(stat -c %u "$f" 2>/dev/null) || return 2
-  [ "$owner" = "$UID_" ] || return 2
-  case "$mode" in ''|*[!0-7]*) return 2 ;; esac
-  [ $(( (8#$mode) & 077 )) -eq 0 ] || return 2
-  IFS= read -r -n 256 line < "$f" || true
-  key=$(printf '%s' "$line" | tr -d '[:space:]')
-  [ -n "$key" ] || return 1
-  # Charset whitelist: also guarantees the key cannot break out of the curl
-  # config string below.
-  case "$key" in *[!A-Za-z0-9._-]*) return 2 ;; esac
-  [ "${#key}" -le 128 ] || return 2
-  return 0
-}
-
-CACHE_OK=0
-if [ ! -e "$CACHE_DIR" ]; then
-  mkdir -p "$CACHE_DIR" 2>/dev/null || true
-fi
-dir_is_safe "$CACHE_DIR" && CACHE_OK=1
-
-# Fresh cache short-circuits the request.
-if [ "$FORCE" -eq 0 ] && cache_is_usable; then
-  age=$(( $(date +%s) - $(stat -c %Y "$CACHE") ))
-  if [ "$age" -lt "$TTL" ]; then
-    cat "$CACHE"
+# Fresh cache short-circuits the request. The age comes from the fstat(2) of
+# the already-open descriptor reported above — no second pathname lookup.
+if [ "$FORCE" -eq 0 ] && [ "$CACHED_OK" = 1 ]; then
+  age=$(( $(date +%s) - CACHED_MTIME ))
+  if [ "$age" -ge 0 ] && [ "$age" -lt "$TTL" ]; then
+    printf '%s\n' "$CACHED_BODY"
     exit 0
   fi
 fi
 
-read_key "$KEY_FILE"
+# --- Key read: one fused secure operation ---------------------------------
+# Exit 0 with the key on stdout, 1 = missing/empty (nokey), 2 = unsafe
+# (badkey). The key travels from the descriptor to this shell variable and
+# then straight into curl's private config pipe — never through argv or env.
+key=""
+key="$(python3 "$SECIO" read-key "$KEY_FILE" 2>/dev/null)"
 case $? in
   0) ;;
   1) emit_fail "nokey"; exit 0 ;;
@@ -207,14 +197,13 @@ if jq -e '(.fiveHour != null) and (.weekly != null)
           and (.fiveHour.quota > 0) and (.weekly.quota > 0)
           and (.fiveHour.nextResetMs > 0) and (.weekly.nextResetMs > 0)' \
     <<<"$report" >/dev/null 2>&1; then
-  # Publish through an exclusive, unpredictable same-directory temporary,
-  # then rename over the cache path. rename(2) replaces a symlink planted
-  # at the destination instead of following it.
-  if [ "$CACHE_OK" = 1 ]; then
-    cache_tmp="$(mktemp "$CACHE_DIR/.glm-quota.XXXXXX" 2>/dev/null)" \
-      && { printf '%s' "$report" > "$cache_tmp" 2>/dev/null \
-           && mv -f "$cache_tmp" "$CACHE" 2>/dev/null \
-           || rm -f "$cache_tmp"; } || true
+  # Publish through secio: exclusive unpredictable temporary created and
+  # renamed relative to the pinned cache-directory descriptor; rename(2)
+  # replaces a symlink planted at the destination instead of following it.
+  if [ "$CACHE_W" = 1 ]; then
+    printf '%s\n' "$report" \
+      | python3 "$SECIO" write-cache "$CACHE_DIR" "$CACHE_NAME" 2>/dev/null \
+      || true
   fi
   printf '%s\n' "$report"
 else

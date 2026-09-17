@@ -82,18 +82,30 @@ Inline in `~/.config/omarchy/shell.json`, e.g.
 
 ## Security
 
+- All file access is fused check-and-use on file descriptors via
+  `bin/glm-quota-secio.py`: paths are resolved one component at a time with
+  `O_NOFOLLOW|O_DIRECTORY`, the verified directory descriptor is kept open,
+  and every file is `fstat(2)`-verified *after* opening — never before.
+  Swapping a pathname (or a parent directory component) for a symlink
+  between a check and a use is therefore structurally impossible.
 - The API key is fed to curl through a private pipe (`curl -K`), so it never
-  appears in any process's `argv` (no leak via `ps`), and its charset is
-  validated before use.
+  appears in any process's `argv` (no leak via `ps`) or environment, and its
+  charset is validated before use.
 - The key file must pass a strict check: regular file (never followed
   through a symlink), owned by the current user, no group/other permission
   bits — `chmod 600` it and keep it that way.
 - API responses are capped on the producer side at 64 KiB; anything larger
   is rejected before parsing, so a hostile endpoint cannot exhaust disk or
   memory.
-- Cache updates go through an exclusive, unpredictable same-directory
-  temporary file (`mktemp`) and an atomic rename; planted symlinks on the
-  cache path are replaced, never followed.
+- Cache updates are published through an exclusive, unpredictable
+  same-directory temporary (`secrets`-random name, `O_CREAT|O_EXCL|
+  O_NOFOLLOW`, mode 600) that is created and `rename(2)`d relative to the
+  pinned cache-directory descriptor; planted symlinks on the cache path are
+  replaced, never followed.
+- Threat boundary: these measures defeat path-race attacks from other local
+  principals or untrusted code swapping paths out from under the plugin.
+  A process already running as your own user can of course read your files
+  directly; that class of compromise is out of scope.
 
 ## Uninstall
 

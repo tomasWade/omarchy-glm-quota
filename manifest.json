@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "tomaswade.glm-quota",
   "name": "GLM Quota",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "author": "tomasWade",
   "license": "MIT",
   "description": "GLM token quota as a thermometer-style bar: mercury fill = quota used, floating pointer = time through the window. Click for the 5-hour and weekly breakdown.",
